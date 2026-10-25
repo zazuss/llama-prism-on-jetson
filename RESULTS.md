@@ -23,6 +23,7 @@ llama-bench -m <model> -p <CTX> -n 64 -ngl 99 -t 6 -r 1
 | 16 384 | 354.64 | 36.24 | 99.1% |
 | 32 768 | 334.09 | 36.20 | 99.0% |
 | 65 536 | 300.56 | 36.10 | 98.7% |
+| 131 072 (`q4_0` KV) | 214.24 | 35.97 | 94.7% |
 
 `±` where shown is the standard deviation across repeated runs. Single-rep rows (16K and above) are shown without deviation because each takes minutes; the 8K row's ±0.04 on prefill and ±0.24 on generation indicate the run-to-run spread is small enough that single measurements remain meaningful.
 
@@ -30,7 +31,7 @@ llama-bench -m <model> -p <CTX> -n 64 -ngl 99 -t 6 -r 1
 
 **Generation is flat.** 512x more context costs 1.3% of generation speed. For an 8 GB board this is the single most important property — you can give the model a genuinely long document and it keeps talking at the same rate.
 
-**Prefill is where context costs you.** 65536 tokens at 300 t/s means ~218 s to ingest a full 64K prompt. That is a one-time cost per conversation, not a per-token tax. For a 4K prompt it is 11 s; for 8K, 22 s.
+**Prefill is where context costs you.** 65536 tokens at 300 t/s means ~218 s to ingest a full 64K prompt; 131072 tokens at 214 t/s means **~612 s** — ten minutes to first token. That is a one-time cost per conversation, not a per-token tax. For a 4K prompt it is 11 s; for 8K, 22 s.
 
 **Why generation does not degrade.** Naive KV arithmetic assumes every layer caches K and V:
 
@@ -49,6 +50,57 @@ A 2x context increase cost **59 MB**. The dense-attention formula overestimates 
 
 **Transient memory is the real constraint.** During 64K prefill, total used memory briefly hit **6 914 / 7 485 MB**, leaving 83 MB free. It returns to 2.8 GB afterwards. Any long-context run on this board needs a cgroup cage (see README) or that peak can trigger a system-wide OOM that kills unrelated processes.
 
+## Context ceiling: 128K and 256K, measured
+
+The sweep above stops at 64K because each row is a full prefill. The question "how far can the context go" was answered separately with `llama-server`, since the steady-state KV cost — not the sweep rate — is what decides it.
+
+Config for every row: `PTQ1_0` weights, `-ngl 99 -t 6 -fa on`, server started under `systemd-run`. Decode measured with a short prompt so the number reflects steady-state, not prefill.
+
+| Context | KV type | Slots | Steady RSS | Free RAM after | Decode | Verdict |
+|---|---|---|---|---|---|---|
+| 65 536 | fp16 | 4 | 2 775 MB | ~4.6 GB | 36.10 t/s | comfortable |
+| 131 072 | `q8_0` | 1 | 4.76 GB | 360 MB | 35.51 / 36.67 t/s | tight |
+| 131 072 | `q4_0` | 1 | 4.46 GB | **1.4 GB** | 35.37 / 36.59 t/s | **recommended** |
+| 262 144 | `q4_0` | 1 | 5.70 GB | **39 MB** | 36.08 t/s | runs, no headroom |
+| 262 144 | `q4_0` | 4 | — | — | **16.53 t/s** | **OOM on request #2** |
+
+### Finding 1: decode speed is flat from 64K to 256K
+
+A 4x context increase costs **0.05%** of decode speed. This is not tuning — it follows from the architecture. Decode is bound by the weight stream (1.86 GB read per generated token), and the 24 of 32 layers that are not full-attention keep a state whose size does not grow with context. A longer KV cache adds to *memory*, never to the per-token weight traffic, so the rate is unchanged.
+
+An earlier estimate in this repo predicted 128K would drop to about 18 t/s by extrapolating bandwidth linearly against KV size. That was wrong: it assumed KV traffic dominates the per-token stream. At 36 t/s the weight stream is 67 GB/s while the KV stream at 128K is about 1 GB/s — the KV contribution is 1.5% of the total, which is why it cannot move the number.
+
+### Finding 2: `-np` is a bigger lever than KV quantization
+
+`llama-server` defaults to **4 slots**, and each slot reserves the full `n_ctx`:
+
+```
+init: n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+```
+
+Four slots × 256K of KV is roughly a million tokens of cache on a 7.5 GB board. The outcome is worse than OOM alone — it is slow *and* then dies:
+
+| Slots | Context | First request | Second request |
+|---|---|---|---|
+| 1 | 262 144 | 36.08 t/s ✓ | 36.08 t/s ✓ |
+| 4 | 262 144 | 16.53 t/s | `Failed with result 'oom-kill'` |
+
+The 2.2x slowdown is not memory pressure. A four-slot unified KV pool makes the attention path itself slower. Anyone benchmarking long context on a default-configured server and concluding "long context is slow on Jetson" has measured the wrong variable.
+
+### Finding 3: concurrency cannot help a bandwidth-bound model
+
+Single-request decode already moves ~67 GB/s of the ~98 GB/s the board can deliver (measured `cudaMemcpy` ceiling). Splitting that across four slots gives four ~9 t/s streams, not four 36 t/s streams — total throughput is unchanged.
+
+The practical consequence for agent work: spawning parallel sub-agents against a local 9B on this board makes each of them *slower* than running them serially. Parallel sub-agents belong on a cloud API where there is no shared memory bus; the local model is for serial work.
+
+### Load success is not "I can fill it"
+
+Every row above loaded successfully and generated at rate. That does **not** mean a 256K prompt can be pushed through it: the transient prefill buffer scales with prompt length and already peaks at 6 914 / 7 485 MB for a 64K prefill. Steady state and fill-time peak are different questions, and only the second one OOMs.
+
+For an agent that actually fills the window, **128K with `q4_0` KV and `-np 1`** is the practical ceiling here — 1.4 GB of headroom is enough for the rest of the system to keep running. 256K works but leaves 39 MB, at which point the OOM killer reaches for whichever process grows next.
+
+Ready-made launcher for the recommended config: [`scripts/start-bonsai.sh`](scripts/start-bonsai.sh) (`start` / `stop` / `status` / `restart`).
+
 ## Comparison points
 
 | Setup | Params | Quant | Context | Generation | Notes |
@@ -64,11 +116,23 @@ The 9B ternary model is ~31% slower than a 1.7B 4-bit model in raw tok/s while c
 | Model | Format | Disk | Verdict |
 |---|---|---|---|
 | Ternary-Bonsai-2 9B | PTQ1_0 | 1.85 GiB | Fits, runs at 36 t/s |
-| Ternary-Bonsai-2 27B | PTQ1_0 | 5.95 GB | **Does not fit** |
+| Ternary-Bonsai-2 27B | PTQ1_0 | 5 671 MB | **Does not fit** (295 MB over the CUDA ceiling) |
 
-The 27B budget: 5.95 GB weights + ~300 MB CUDA context + ~400 MB compute buffers + KV + ~1.5 GB system = **8.6 GB+** against 7.31 GiB managed. The 1.3 GB gap is the board's hardware limit, not something quantization or flags can close.
+The 27B budget, re-measured 2026-10-25: weights alone are **5 671 MB** (not 5.95 GB — the HF figure includes an older packing). That is **295 MB** over the 5 376 MB multi-block CUDA allocation ceiling measured on this board, before any KV cache. See the corrected allocation numbers below.
 
-Related hardware fact, since it gets misdiagnosed: a single `cudaMalloc` on this Orin caps at **4.85 GB** (measured 1/2/4 GB OK, 5 GB and 6.5 GB OOM). The frequently-cited "1 GB limit on Jetson" belongs to the CMA/NvMap path (`CmaTotal` 256 MB, `CmaFree` 3.3 MB), which V4L2/ISP/display use. GGML allocates through CUDA, not CMA, so CMA is never the reason a model fails to load.
+Related hardware fact, since it gets misdiagnosed: a single contiguous `cudaMalloc` on this Orin caps at **4 576 MB**, and cumulative multi-block allocation reaches **5 376 MB** (7 × 768 MB, 8th block fails). Both measured directly with a purpose-built probe run under `systemd-run --scope -p MemoryMax=infinity`; running the same probe inside an agent's background wrapper gives a smaller, wrong answer because it inherits a 3.65 GiB cgroup. llama.cpp allocates per-tensor rather than in one block, so **5 376 MB is the number that matters for model loading**. The frequently-cited "1 GB limit on Jetson" belongs to the CMA/NvMap path (`CmaTotal` 256 MB, `CmaFree` 3.3 MB), which V4L2/ISP/display use. GGML allocates through CUDA, not CMA, so CMA is never the reason a model fails to load.
+
+### CUDA allocation ceiling, re-measured
+
+An earlier version of this document quoted **4.85 GB** as a fixed per-allocation limit. That was one observation reported as a constant. A dedicated probe (`cudaMalloc` → `cudaMemcpy` → free, size found by bisection) gives:
+
+| Test | Result |
+|---|---|
+| Largest single contiguous `cudaMalloc` | **4 576 MB** |
+| Cumulative across 768 MB blocks | **5 376 MB** (7 OK, 8th fails) |
+| `cudaMemcpy` device↔host throughput | **98 GB/s** |
+
+The numbers depend on how much memory is free at that moment: the same probe returned 4 320 MB while the desktop stack was still warm, 4 576 MB after it settled. Treat it as a range (~4.4–4.6 GB single, ~5.2–5.4 GB cumulative), not a hardware constant. Chunking buys about 17%, not access to the full 7.31 GiB.
 
 ## Agent capability: reasoning and tool calling
 
