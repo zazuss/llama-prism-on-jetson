@@ -68,7 +68,7 @@ Config for every row: `PTQ1_0` weights, `-ngl 99 -t 6 -fa on`, server started un
 
 A 4x context increase costs **0.05%** of decode speed. This is not tuning — it follows from the architecture. Decode is bound by the weight stream (1.86 GB read per generated token), and the 24 of 32 layers that are not full-attention keep a state whose size does not grow with context. A longer KV cache adds to *memory*, never to the per-token weight traffic, so the rate is unchanged.
 
-An earlier estimate in this repo predicted 128K would drop to about 18 t/s by extrapolating bandwidth linearly against KV size. That was wrong: it assumed KV traffic dominates the per-token stream. At 36 t/s the weight stream is 67 GB/s while the KV stream at 128K is about 1 GB/s — the KV contribution is 1.5% of the total, which is why it cannot move the number.
+An earlier estimate in this repo predicted 128K would drop to about 18 t/s by extrapolating bandwidth linearly against KV size. That was wrong: it assumed KV traffic dominates the per-token stream. At 36 t/s the weight stream is 67 GB/s while the KV stream at 128K is about 1.4 GB/s — the KV contribution is 2% of the total, which is why it cannot move the number.
 
 ### Finding 2: `-np` is a bigger lever than KV quantization
 
