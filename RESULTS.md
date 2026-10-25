@@ -1,5 +1,8 @@
 # Measured results
 
+> **中文速览** —— 这份文档是 PrismML llama.cpp fork 在 Jetson Orin 上的完整实测报告：编译过程、上下文扫描跑分表（带误差）、和 MLC-LLM 的对照分析、agent 能力测试（推理 5/5、工具调用 10/10、thinking 开关的代价）、内存与 cgroup 分析。README 里的结论，原始数据都在这里。
+
+
 All numbers from a Jetson Orin Nano 8GB (L4T R39.2.1, Ubuntu 24.04.4, CUDA 13.2, sm_87, 6 cores, 7.3 GiB usable).
 
 Model: `Ternary-Bonsai-2-9B-PTQ1_0.gguf` — 1.85 GiB on disk, 8.95 B parameters, 1.75 bits/weight, ternary groups of 128.
