@@ -35,11 +35,12 @@ elif [ -x "/home/orin/llama-prism/build/bin/llama-server" ]; then
 else
     BIN_DIR="$_REPO/bin"                       # 报错时会提示这个路径
 fi
-CTX="${BONSAI_CTX:-131072}"        # 128K。要 256K 改成 262144（余量只剩 39MB）
-NP="${BONSAI_NP:-1}"               # 单路。不要改大
-KV="${BONSAI_KV:-q4_0}"            # q4_0 最省；q8_0 质量更好但多占 300MB
-PORT="${BONSAI_PORT:-8099}"
-THREADS="${BONSAI_THREADS:-6}"
+# 两种写法都认：BONSAI_CTX（推荐）或 CTX
+CTX="${BONSAI_CTX:-${CTX:-131072}}"          # 128K。要 256K 改成 262144（余量只剩 39MB）
+NP="${BONSAI_NP:-${NP:-1}}"                  # 单路。不要改大
+KV="${BONSAI_KV:-${KV:-q4_0}}"               # q4_0 最省；q8_0 质量更好但多占 300MB
+PORT="${BONSAI_PORT:-${PORT:-8099}}"
+THREADS="${BONSAI_THREADS:-${THREADS:-6}}"
 UNIT="bonsai-server"
 MEM_HIGH="6.2G"
 MEM_MAX="6.8G"
