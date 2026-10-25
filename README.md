@@ -37,6 +37,29 @@ This is not the behaviour you would get from a dense-attention model. The reason
 
 The 27B variant is 5.95 GB on disk. Model + CUDA context + compute buffers + system needs >8.6 GB on this board, which presents only 7.31 GiB managed memory. That 1.3 GB gap is a hardware limit, not a tuning problem — it is closed. 9B is the ceiling for a 7.3 GiB Orin.
 
+## Prebuilt binaries
+
+Don't want to compile? There's a prebuilt CUDA binary on the release page:
+
+**→ [Download `llama-prism-bin-jetson-orin-cuda13.2-sm87.tar.gz`](https://github.com/zazuss/llama-prism-on-jetson/releases/latest/download/llama-prism-bin-jetson-orin-cuda13.2-sm87.tar.gz)** (56.6 MB, 135 files)
+
+```bash
+mkdir -p ~/llama-prism-bin
+tar xzf llama-prism-bin-jetson-orin-cuda13.2-sm87.tar.gz -C ~/llama-prism-bin
+export LD_LIBRARY_PATH=$HOME/llama-prism-bin:$LD_LIBRARY_PATH
+~/llama-prism-bin/llama-cli --list-devices   # expect CUDA0: Orin
+```
+
+**Requirements must match exactly**, or you get `undefined symbol` / `GLIBCXX not found`:
+
+| Component | Required |
+|---|---|
+| L4T / JetPack | **R39.2.1** (JetPack 7.x) |
+| CUDA | **13.2** (links `libcudart.so.13`, `libcublas.so.13`) |
+| Compute capability | **sm_87** |
+
+Works on Orin Nano / NX / AGX (all sm_87). On a different L4T or CUDA version, build from source below instead — the ternary kernels are CUDA-version-sensitive.
+
 ## Build
 
 Prerequisites: CUDA toolkit matching your L4T, `cmake` >= 3.20, `g++`, ~10 GB free disk, and ideally 4 GB+ swap.
