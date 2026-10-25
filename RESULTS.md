@@ -126,13 +126,15 @@ Related hardware fact, since it gets misdiagnosed: a single contiguous `cudaMall
 
 An earlier version of this document quoted **4.85 GB** as a fixed per-allocation limit. That was one observation reported as a constant. A dedicated probe (`cudaMalloc` → `cudaMemcpy` → free, size found by bisection) gives:
 
-| Test | Result |
-|---|---|
-| Largest single contiguous `cudaMalloc` | **4 576 MB** |
-| Cumulative across 768 MB blocks | **5 376 MB** (7 OK, 8th fails) |
-| `cudaMemcpy` device↔host throughput | **98 GB/s** |
+| Environment | `MemAvailable` | Single contiguous | Cumulative (768 MB chunks) |
+|---|---|---|---|
+| Bonsai + searxng stopped | 4 739 MB | **4 608 MB** | **5 376 MB** (7 chunks) |
+| Bonsai stopped only | 4 593 MB | **4 384 MB** | **4 608 MB** (6 chunks) |
+| `cudaMemcpy` device↔host | — | — | **98 GB/s** |
 
-The numbers depend on how much memory is free at that moment: the same probe returned 4 320 MB while the desktop stack was still warm, 4 576 MB after it settled. Treat it as a range (~4.4–4.6 GB single, ~5.2–5.4 GB cumulative), not a hardware constant. Chunking buys about 17%, not access to the full 7.31 GiB.
+Two rules: single contiguous ≈ `MemAvailable` − 200 MB, and cumulative is quantised by chunk size (a whole 768 MB step at a time), so it is a step function of ambient memory rather than a smooth curve. Peak observed anywhere so far: **5 376 MB**.
+
+Chunking buys ~17% (4 608 → 5 376 MB), not access to the full 7.31 GiB. Roughly 1.9 GiB of managed memory stays out of CUDA's reach regardless of how the request is sliced.
 
 ## Agent capability: reasoning and tool calling
 
