@@ -33,6 +33,18 @@ Ternary-Bonsai-2 **9B** (`PTQ1_0`, 1.85 GiB, 8.95 B params, 1.75 bpw) on a 7.3 G
 
 This is not the behaviour you would get from a dense-attention model. The reason is architectural: `qwen35` uses hybrid attention (`full_attention_interval = 4`), so only a fraction of layers build a KV cache. Steady-state RSS stays at **~2.8 GB** even at 64K context — barely above the 32K case (2.7 GB). Naive KV arithmetic (`2 x layers x kv_heads x key_len x 2 bytes` on every layer) overestimates the cost by roughly 4x.
 
+## Does it actually work as an agent?
+
+Raw tok/s is not the question that matters. The model is 1.75 bits per weight — the real question is whether reasoning and tool calling survived that. Measured, thinking disabled:
+
+- **Reasoning: 5/5.** Multi-step arithmetic, a counter-intuitive ratio problem, a self-referential knight/knave puzzle, code generation, and a Chinese grammar judgement — all correct.
+- **Tool calling: 10/10.** Single and parallel calls, correct choice between two similar tools (`get_weather` vs `get_forecast`), nested array parameters, enum values, no spurious calls on plain chat or trivial maths, and correct refusal to run a destructive command without a target path. Multi-turn continuation and error recovery (`RATE_LIMITED`) both behave — no retry loop, no fabrication.
+- **Latency: 0.4–3.7 s** per agent step. That is what makes it usable locally.
+
+**Turn thinking mode off.** It defaults on, costs 2 192 tokens / 60.9 s on a question that takes 332 tokens / 9.4 s with thinking disabled — identical answers. Below ~1 500 `max_tokens` the reasoning trace eats the whole budget and `content` returns empty.
+
+Full tables, reproductions, and the cgroup trap that silently OOM-kills the server: [RESULTS.md](RESULTS.md#agent-capability-reasoning-and-tool-calling).
+
 ## Why 9B and not 27B
 
 The 27B variant is 5.95 GB on disk. Model + CUDA context + compute buffers + system needs >8.6 GB on this board, which presents only 7.31 GiB managed memory. That 1.3 GB gap is a hardware limit, not a tuning problem — it is closed. 9B is the ceiling for a 7.3 GiB Orin.
@@ -164,6 +176,7 @@ Never compile and run inference at the same time on 8 GB. `cc1plus` + `nvcc` + a
 4. **`CMA` limits are irrelevant here** but commonly blamed: single `cudaMalloc` on Orin caps at **4.85 GB** (measured), while the 1 GB ceiling people remember is the CMA/NvMap path (`CmaTotal` 256 MB) used by V4L2/ISP/display. GGML does not touch CMA.
 5. **Do not mix `.so` files between stock llama.cpp and this fork.** `ggml` ABI differs; you get silent wrong output or a crash.
 6. **`LD_LIBRARY_PATH` must point at `build/bin`** or the binary loads system `libggml` and fails with a version skew.
+7. **A loaded 9B server needs 4.5 GB resident.** Started from an agent/shell background-job wrapper it can inherit a cgroup capped around 3.65 GiB, and the kernel OOM-kills it the first time KV grows — `llama-server` prints nothing, the process just vanishes mid-request. Run it under its own unit with an explicit ceiling (`systemd-run --user --unit=... -p MemoryMax=6.8G`), and check `journalctl --user -u <unit>` rather than the llama log when it dies silently.
 
 ## License
 

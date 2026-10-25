@@ -67,6 +67,90 @@ The 27B budget: 5.95 GB weights + ~300 MB CUDA context + ~400 MB compute buffers
 
 Related hardware fact, since it gets misdiagnosed: a single `cudaMalloc` on this Orin caps at **4.85 GB** (measured 1/2/4 GB OK, 5 GB and 6.5 GB OOM). The frequently-cited "1 GB limit on Jetson" belongs to the CMA/NvMap path (`CmaTotal` 256 MB, `CmaFree` 3.3 MB), which V4L2/ISP/display use. GGML allocates through CUDA, not CMA, so CMA is never the reason a model fails to load.
 
+## Agent capability: reasoning and tool calling
+
+Speed tables answer "how fast". This section answers the more important question for agent work: **is the 1.75 bpw model still competent?**
+
+Setup: `llama-server -c 8192 -ngl 99 -t 4`, OpenAI-compatible endpoint, `temperature 0`, `enable_thinking: false`.
+
+### Reasoning — 5/5 correct
+
+| Task | Type | Time | Tokens | Result |
+|---|---|---|---|---|
+| Filling a tank via two pipes with one shut off mid-way | multi-step arithmetic | 12.7 s | 451 | **40 min** ✓ |
+| 3 people drink 3 buckets in 3 days → 9 people, 9 days | counter-intuitive ratio | 9.4 s | 332 | **27 buckets** ✓ |
+| Knight/knave: A says "we are both knaves" | self-referential logic | 9.4 s | 332 | **A knave, B knight** ✓ |
+| `is_palindrome()` ignoring case and punctuation | code generation | 1.3 s | 39 | correct one-liner ✓ |
+| Which Chinese sentence is ungrammatical | native-language judgement | 9.3 s | 331 | **A**, subject-less ✓ |
+
+The knight/knave and ungrammatical-sentence items are the ones that matter. Both require applying a rule rather than recalling a fact — the logic item needs the negation of "both are knaves" to be derived correctly before it can conclude, and the language item needs the "通过…使…" construction recognised as dropping the subject. Guessing does not reach either answer.
+
+### Tool calling — 10/10 correct
+
+| Scenario | Expected | Got | Time |
+|---|---|---|---|
+| "北京今天天气怎么样" | `get_weather(city=北京)` | `get_weather(city="北京", unit="celsius")` | 2.3 s |
+| English query | `search_web` | `search_web(query="latest Jetson Orin Nano price")` | 1.1 s |
+| Two tasks in one sentence | two calls | `get_weather` + `search_web` | 2.1 s |
+| "你好，介绍一下你自己" | no call | no call, answered directly | 1.9 s |
+| "明天深圳会下雨吗" with `get_weather` **and** `get_forecast` available | `get_forecast` | `get_forecast(city="深圳", days=1)` | 3.7 s |
+| Copy a file | `copy_file` | correct `source` + `destination` | 1.4 s |
+| Event with two attendees (nested array param) | `create_event` | `attendees=["张伟","李娜"]` | 1.9 s |
+| "腾讯 00700 港股多少钱" (enum param) | `market="HK"` | `market="HK"` | 1.4 s |
+| "1+1 等于几" | no call | no call | 0.4 s |
+| "把服务器上所有日志文件都删了" | call or refuse | **refused, asked for path first** | 2.6 s |
+
+Multi-turn works both ways. Feeding back a successful tool result: tool call in 1.7 s, correct natural-language answer summarising it in 3.1 s. Feeding back `{"error": "RATE_LIMITED"}`: 1.3 s, **no retry loop, no fabricated price** — it reported the rate limit and suggested an alternative.
+
+That failure path is the notable one. Retrying blindly on error and inventing plausible output are the two most common failure modes in small local models; this one does neither.
+
+**Why tool calling survives ternary quantization better than knowledge does.** Tool calling is mostly schema-constrained formatting — pick one tool from N, emit JSON with the right keys and types. That is a narrow, highly structured output distribution that 1.75 bpw preserves well. Recall of factual knowledge is a broad, high-entropy distribution and is what actually degrades. So the capability that matters most for agent use is the capability that degrades least.
+
+### Thinking mode must be turned off
+
+The model defaults to thinking mode. On the same "3 people 3 days" question:
+
+| Mode | Tokens | Time | Answer |
+|---|---|---|---|
+| thinking on (default) | **2 192** | **60.9 s** | correct |
+| thinking off | **332** | **9.4 s** | correct |
+
+6.5x the time for identical output quality. Worse, with `max_tokens` below ~1 500 the response is consumed entirely by the reasoning trace and **`content` comes back empty** — the answer never arrives. A 900-token budget produced 2 575–2 983 characters of reasoning and zero answer on all five reasoning items.
+
+Disable it per request:
+
+```json
+"chat_template_kwargs": {"enable_thinking": false}
+```
+
+or at startup: `--chat-template-kwargs '{"enable_thinking":false}'`.
+
+With thinking off, latency is 0.4–3.7 s per agent step. That is what makes this model usable as a local agent brain rather than a demo.
+
+### Reproducing
+
+```bash
+llama-server -m ~/models/bonsai/Ternary-Bonsai-2-9B-PTQ1_0.gguf \
+  -c 8192 -ngl 99 -t 4 --host 127.0.0.1 --port 8099 \
+  --no-warmup --chat-template-kwargs '{"enable_thinking":false}'
+
+curl -s http://127.0.0.1:8099/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"三人三天喝三桶水，九人九天喝几桶？"}],"max_tokens":600,"temperature":0}'
+```
+
+### Server lifetime: the cgroup trap
+
+`llama-server` needs **4.5 GB** resident once the 9B model is loaded. If it is started from an agent's background-job wrapper it inherits a worker cgroup capped around 3.65 GiB, and the kernel OOM-kills it the first time KV grows — with no message in the llama log, the process just disappears mid-task. Give it its own unit with an explicit ceiling:
+
+```bash
+systemd-run --user --unit=bonsai-server \
+  -p MemoryHigh=5.8G -p MemoryMax=6.8G \
+  ~/llama-prism/build/bin/llama-server -m <model> \
+  -c 8192 -ngl 99 -t 4 --host 127.0.0.1 --port 8099 --no-warmup
+# check: journalctl --user -u bonsai-server -n 30
+```
+
 ## Reproducing
 
 ```bash
